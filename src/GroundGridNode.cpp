@@ -208,7 +208,61 @@ class GroundGridNode : public rclcpp::Node {
         param_eval.description = "Evaluation mode: wait for clouds to be processed";
         eval_ = declare_parameter<bool>("groundgrid/evaluation", false, param_eval);
 
+        // Map geometry. Upstream hardcoded 120 m across at 0.33 m -- automotive sizing.
+        // An indoor robot with a 20 m sensor wants a much smaller extent, and the cells
+        // saved there buy resolution: 40 m at 0.15 m is FEWER cells than the default
+        // (70.8k vs 131.8k) at more than twice the detail, and it shrinks the
+        // ground-estimation patch from 1.65 m to 0.75 m -- which is what stops a
+        // chair-sized flat object from defining the ground height of its own cell.
+        auto param_map_res = rcl_interfaces::msg::ParameterDescriptor{};
+        param_map_res.description = "[double] Grid cell size [m]. Applied at startup only.";
+        groundgrid_->mResolution = declare_parameter<double>("groundgrid/map_resolution", 0.33, param_map_res);
+        auto param_map_dim = rcl_interfaces::msg::ParameterDescriptor{};
+        param_map_dim.description = "[double] Grid extent [m], square, centred on the robot. Startup only.";
+        groundgrid_->mDimension = declare_parameter<double>("groundgrid/map_dimension", 120.0, param_map_dim);
+        RCLCPP_INFO(get_logger(), "ground grid: %.1f m across at %.2f m -> %d x %d cells",
+                    groundgrid_->mDimension, groundgrid_->mResolution,
+                    int(groundgrid_->mDimension/groundgrid_->mResolution),
+                    int(groundgrid_->mDimension/groundgrid_->mResolution));
+
         ground_segmentation_.init(groundgrid_->mDimension, groundgrid_->mResolution, config_gg, visualize);
+        config_live_ = config_gg;
+        // Live tuning. Without this, ros2 param set reports success and changes nothing,
+        // because config_gg was copied into the segmenter above.
+        param_cb_ = add_on_set_parameters_callback(
+            [this](const std::vector<rclcpp::Parameter>& params){
+                rcl_interfaces::msg::SetParametersResult res;
+                res.successful = true;
+                auto pos = [&](const rclcpp::Parameter& q, double& dst, double lo, double hi){
+                    const double v = q.as_double();
+                    if(!(v >= lo && v <= hi)){        // also rejects NaN
+                        res.successful = false;
+                        res.reason = q.get_name() + " out of range";
+                        return;
+                    }
+                    dst = v;
+                };
+                auto cfg = config_live_;
+                for(const auto& q : params){
+                    const auto& n = q.get_name();
+                    if(n == "groundgrid/min_point_height_thres")            pos(q, cfg.min_point_height_thres, 0.02, 1.0);
+                    else if(n == "groundgrid/min_point_height_obstacle_thres") pos(q, cfg.min_point_height_obstacle_thres, 0.02, 1.0);
+                    else if(n == "groundgrid/outlier_tolerance")            pos(q, cfg.outlier_tolerance, 0.0, 1.0);
+                    else if(n == "groundgrid/min_ground_patch_detection_point_count_thres") pos(q, cfg.min_ground_patch_detection_point_count_thres, 0.0, 5.0);
+                    else if(n == "groundgrid/occupied_cells_point_count_factor") pos(q, cfg.occupied_cells_point_count_factor, 1.0, 200.0);
+                    else if(n == "groundgrid/min_outlier_detection_ground_confidence") pos(q, cfg.min_outlier_detection_ground_confidence, 0.0, 10.0);
+                    // map_resolution / map_dimension are deliberately absent: changing
+                    // them means rebuilding the grid, not editing a threshold.
+                    if(!res.successful) return res;
+                }
+                config_live_ = cfg;
+                ground_segmentation_.setConfig(cfg);
+                RCLCPP_INFO(get_logger(), "ground filter retuned: min_point_height=%.3f "
+                            "obstacle_thres=%.3f outlier_tol=%.3f patch_pts=%.3f",
+                            cfg.min_point_height_thres, cfg.min_point_height_obstacle_thres,
+                            cfg.outlier_tolerance, cfg.min_ground_patch_detection_point_count_thres);
+                return res;
+            });
 
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
@@ -507,6 +561,8 @@ class GroundGridNode : public rclcpp::Node {
     // name of the dataset
     std::string dataset_name;
     std::string sensor_frame_;
+    GroundGrid_Config config_live_;
+    rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_cb_;
     // path to the dataset
     std::string dataset_path;
     // path to the odometry poses file

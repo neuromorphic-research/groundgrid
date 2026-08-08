@@ -66,8 +66,12 @@ class GroundGrid {
     void init(const nav_msgs::msg::Odometry::ConstSharedPtr &inOdom);
     std::shared_ptr<grid_map::GridMap> update(const nav_msgs::msg::Odometry::ConstSharedPtr& inOdom);
 
-    const float mResolution = .33f;
-    const float mDimension = 120.0f;
+    // Not const: set from ROS parameters before init(). The defaults are the paper's
+    // automotive geometry -- 120 m across at 0.33 m is sized for a car on a highway.
+    // An indoor robot wants a far smaller extent and much finer cells; see
+    // groundgrid/map_dimension and groundgrid/map_resolution.
+    float mResolution = .33f;
+    float mDimension = 120.0f;
 
    private:
     // tf

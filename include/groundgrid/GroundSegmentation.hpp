@@ -104,6 +104,10 @@ class GroundSegmentation {
 
     GroundSegmentation() : filter_chain_("grid_map::GridMap") {};
     void init(const size_t dimension, const float& resolution, const GroundGrid_Config& config = GroundGrid_Config(), const bool visualize_segmentation = false);
+
+    /// Replace the tuning thresholds on a running segmenter. Geometry (dimension,
+    /// resolution) is NOT covered -- that would require rebuilding the grid.
+    void setConfig(const GroundGrid_Config& config) { config_ = config; }
     sensor_msgs::msg::PointCloud2::SharedPtr filter_cloud(const sensor_msgs::msg::PointCloud2::ConstSharedPtr cloud, const PCLPoint& cloudOrigin, const geometry_msgs::msg::TransformStamped& mapToBase, grid_map::GridMap &map);
     void insert_cloud(const sensor_msgs::msg::PointCloud2::ConstSharedPtr cloud, const size_t start, const size_t end, const PCLPoint& cloudOrigin, std::vector<std::pair<size_t, grid_map::Index> >& point_index, std::vector<std::pair<size_t, grid_map::Index> >& ignored, std::vector<size_t>& outliers, grid_map::GridMap &map);
     // section defines the section of the map to process (0: top-left, 1: top-right, 2: bottom-left, 3: bottom-right)
