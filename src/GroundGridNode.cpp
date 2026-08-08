@@ -57,6 +57,7 @@ OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <rclcpp/qos.hpp>
 #include <tf2/LinearMath/Quaternion.hpp>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
+#include <sensor_msgs/point_cloud2_iterator.hpp>
 #include <tf2_sensor_msgs/tf2_sensor_msgs.hpp>
 
 // grid map
@@ -110,6 +111,12 @@ class GroundGridNode : public rclcpp::Node {
         
         grid_map_pub_ = create_publisher<grid_map_msgs::msg::GridMap>("/groundgrid/grid_map", rclcpp::SensorDataQoS());
         filtered_cloud_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>("/groundgrid/filtered_cloud", rclcpp::ServicesQoS());
+        // Split outputs. Upstream publishes ONE cloud with the class encoded in the
+        // intensity channel (99 obstacle / 49 ground), which every consumer then has to
+        // re-split. Publishing them separately makes this a drop-in for the segmenters
+        // that already do (Patchwork++ et al.), with SensorData QoS to match them.
+        ground_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>("/groundgrid/ground", rclcpp::SensorDataQoS());
+        nonground_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>("/groundgrid/nonground", rclcpp::SensorDataQoS());
 
         groundgrid_ = std::make_shared<GroundGrid>(get_clock());
 
@@ -194,6 +201,9 @@ class GroundGridNode : public rclcpp::Node {
         auto param_visualize = rcl_interfaces::msg::ParameterDescriptor{};
         param_visualize.description = "Real-time visualization (impacts run-time performance)";
         bool visualize = declare_parameter<bool>("groundgrid/visualize", false, param_visualize);
+        auto param_sensor_frame = rcl_interfaces::msg::ParameterDescriptor{};
+        param_sensor_frame.description = "[string] TF frame of the sensor origin the cloud was captured from";
+        sensor_frame_ = declare_parameter<std::string>("groundgrid/sensor_frame", "velodyne", param_sensor_frame);
         auto param_eval = rcl_interfaces::msg::ParameterDescriptor{};
         param_eval.description = "Evaluation mode: wait for clouds to be processed";
         eval_ = declare_parameter<bool>("groundgrid/evaluation", false, param_eval);
@@ -310,7 +320,67 @@ class GroundGridNode : public rclcpp::Node {
         return true;
     }
 
-    virtual void points_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& cloud_msg){
+    // Split the labelled cloud on the intensity channel GroundSegmentation writes into
+    // (99 = obstacle, 49 = ground). Threshold at 75 rather than testing equality, so a
+    // value arriving as 98.999 cannot land in neither bucket.
+    void publishSplit(const sensor_msgs::msg::PointCloud2& labelled)
+    {
+        const bool want_g = ground_pub_->get_subscription_count() > 0;
+        const bool want_n = nonground_pub_->get_subscription_count() > 0;
+        if(!want_g && !want_n)
+            return;
+        sensor_msgs::PointCloud2ConstIterator<float> ix(labelled, "x"), iy(labelled, "y"),
+                                                     iz(labelled, "z"), ii(labelled, "intensity");
+        std::vector<std::array<float,3>> g, n;
+        g.reserve(labelled.width); n.reserve(labelled.width);
+        for(; ix != ix.end(); ++ix, ++iy, ++iz, ++ii)
+            (*ii > 75.0f ? n : g).push_back({*ix, *iy, *iz});
+        auto emit = [&](const std::vector<std::array<float,3>>& pts,
+                        const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr& pub){
+            sensor_msgs::msg::PointCloud2 out;
+            out.header = labelled.header;
+            sensor_msgs::PointCloud2Modifier mod(out);
+            mod.setPointCloud2FieldsByString(1, "xyz");
+            mod.resize(pts.size());
+            sensor_msgs::PointCloud2Iterator<float> ox(out, "x"), oy(out, "y"), oz(out, "z");
+            for(const auto& pt : pts){ *ox = pt[0]; *oy = pt[1]; *oz = pt[2]; ++ox; ++oy; ++oz; }
+            pub->publish(out);
+        };
+        if(want_g) emit(g, ground_pub_);
+        if(want_n) emit(n, nonground_pub_);
+    }
+
+    // GroundSegmentation indexes fields[3] (intensity) and fields[4] (ring) POSITIONALLY
+    // and writes its result into intensity. A cloud carrying only xyz -- what a footprint
+    // filter or any driver that strips extras produces -- reads out of bounds there.
+    // Widen it here rather than making every caller carry dummy channels.
+    sensor_msgs::msg::PointCloud2::SharedPtr ensureXYZIR(
+        const sensor_msgs::msg::PointCloud2::ConstSharedPtr& in)
+    {
+        if(in->fields.size() >= 5)
+            return std::make_shared<sensor_msgs::msg::PointCloud2>(*in);
+        auto out = std::make_shared<sensor_msgs::msg::PointCloud2>();
+        out->header = in->header;
+        out->height = 1;
+        out->is_bigendian = in->is_bigendian;
+        out->is_dense = in->is_dense;
+        sensor_msgs::PointCloud2Modifier mod(*out);
+        mod.setPointCloud2Fields(5,
+            "x", 1, sensor_msgs::msg::PointField::FLOAT32,
+            "y", 1, sensor_msgs::msg::PointField::FLOAT32,
+            "z", 1, sensor_msgs::msg::PointField::FLOAT32,
+            "intensity", 1, sensor_msgs::msg::PointField::FLOAT32,
+            "ring", 1, sensor_msgs::msg::PointField::UINT16);
+        mod.resize(in->width * in->height);
+        sensor_msgs::PointCloud2ConstIterator<float> ix(*in, "x"), iy(*in, "y"), iz(*in, "z");
+        sensor_msgs::PointCloud2Iterator<float> ox(*out, "x"), oy(*out, "y"), oz(*out, "z");
+        for(; ix != ix.end(); ++ix, ++iy, ++iz, ++ox, ++oy, ++oz){ *ox = *ix; *oy = *iy; *oz = *iz; }
+        return out;   // intensity/ring zeroed: intensity is an OUTPUT, ring is never read
+    }
+
+    virtual void points_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& cloud_msg_in){
+        // Accept xyz-only clouds; the segmentation core indexes intensity/ring by position.
+        const sensor_msgs::msg::PointCloud2::ConstSharedPtr cloud_msg = ensureXYZIR(cloud_msg_in);
         auto start = std::chrono::steady_clock::now();
         static size_t time_vals = 0;
         static double avg_time = 0.0;
@@ -327,7 +397,10 @@ class GroundGridNode : public rclcpp::Node {
             tf_buffer_.canTransform("base_link", "odom", cloud_msg->header.stamp, rclcpp::Duration(1,std::nano::den/10));
             mapToBaseTransform = tf_buffer_.lookupTransform("odom", "base_link", cloud_msg->header.stamp);
             tf_buffer_.canTransform(cloud_msg->header.frame_id, "odom", cloud_msg->header.stamp, rclcpp::Duration(0,std::nano::den/10));
-            cloudOriginTransform = tf_buffer_.lookupTransform("odom", "velodyne", cloud_msg->header.stamp);
+            // Was hardcoded "velodyne" -- a dataset assumption that silently fails on any
+            // other robot with "source_frame does not exist". Defaults to velodyne so
+            // existing setups are unchanged.
+            cloudOriginTransform = tf_buffer_.lookupTransform("odom", sensor_frame_, cloud_msg->header.stamp);
         }
         catch (tf2::TransformException &ex) {
             RCLCPP_WARN(get_logger(), "Could not get transform for cloud %s",ex.what());
@@ -337,7 +410,7 @@ class GroundGridNode : public rclcpp::Node {
 
         geometry_msgs::msg::PointStamped origin;
         origin.header = cloud_msg->header;
-        origin.header.frame_id = "velodyne";
+        origin.header.frame_id = sensor_frame_;
         origin.point.x = 0.0f;
         origin.point.y = 0.0f;
         origin.point.z = 0.0f;        
@@ -389,12 +462,13 @@ class GroundGridNode : public rclcpp::Node {
         RCLCPP_DEBUG_STREAM(get_logger(), "total cpu time used: " << c_millis << "ms (avg: " << avg_cpu_time << "ms)") ;
 
         cloud_msg_out->header = cloud_msg->header;
+        // Transform back to the sensor frame UNCONDITIONALLY. Upstream did this INSIDE
+        // the subscription-count check, so the split publishers below would otherwise
+        // emit odom-frame points whenever nothing subscribed to filtered_cloud.
+        tf2::doTransform(*cloud_msg_out, *cloud_msg_out, revtransformStamped);
         if(filtered_cloud_pub_->get_subscription_count())
-        {
-            //put cloud back to sensor frame
-            tf2::doTransform(*cloud_msg_out, *cloud_msg_out, revtransformStamped);
             filtered_cloud_pub_->publish(*cloud_msg_out);
-        }
+        publishSplit(*cloud_msg_out);
 
         auto& map = *map_ptr_;
 
@@ -432,6 +506,7 @@ class GroundGridNode : public rclcpp::Node {
 
     // name of the dataset
     std::string dataset_name;
+    std::string sensor_frame_;
     // path to the dataset
     std::string dataset_path;
     // path to the odometry poses file
@@ -472,6 +547,7 @@ class GroundGridNode : public rclcpp::Node {
     /// publisher
     rclcpp::Publisher<grid_map_msgs::msg::GridMap>::SharedPtr grid_map_pub_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr filtered_cloud_pub_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr ground_pub_, nonground_pub_;
     std::unordered_map<std::string, image_transport::Publisher> layer_pubs_;
 
     /// pointer to the functionality class
