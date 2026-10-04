@@ -173,6 +173,10 @@ class GroundGridNode : public rclcpp::Node {
         auto param_outlier_tolerance = rcl_interfaces::msg::ParameterDescriptor{};
         param_outlier_tolerance.description = "[double] Outlier detection tolerance [m]";
         config_gg.outlier_tolerance = declare_parameter<double>("groundgrid/outlier_tolerance", 0.1, param_outlier_tolerance);
+        auto param_max_ground_descent = rcl_interfaces::msg::ParameterDescriptor{};
+        param_max_ground_descent.description = "[double] Fork: max per-update descent of a high-variance cell's ground estimate toward the robust (mean of cell minima) level [m]; 0 = upstream jump to the lowest point";
+        config_gg.max_ground_descent = declare_parameter<double>("groundgrid/max_ground_descent", 0.0, param_max_ground_descent);
+        config_gg.ground_descent_target = declare_parameter<int>("groundgrid/ground_descent_target", 2);
         auto param_min_ground_patch_detection_point_count_thres = rcl_interfaces::msg::ParameterDescriptor{};
         param_min_ground_patch_detection_point_count_thres.description = "[double] Minimum point count for ground patch detection in percent of expected point count";
         config_gg.min_ground_patch_detection_point_count_thres = declare_parameter<double>("groundgrid/min_ground_patch_detection_point_count_thres", 0.25, param_min_ground_patch_detection_point_count_thres);
@@ -204,6 +208,9 @@ class GroundGridNode : public rclcpp::Node {
         auto param_sensor_frame = rcl_interfaces::msg::ParameterDescriptor{};
         param_sensor_frame.description = "[string] TF frame of the sensor origin the cloud was captured from";
         sensor_frame_ = declare_parameter<std::string>("groundgrid/sensor_frame", "velodyne", param_sensor_frame);
+        auto param_ground_frame = rcl_interfaces::msg::ParameterDescriptor{};
+        param_ground_frame.description = "[string] Fork: frame whose origin lies on the ground under the vehicle; anchors the ground estimate at the vehicle (upstream: base_link, which is on the ground for KITTI-style vehicles)";
+        ground_frame_ = declare_parameter<std::string>("groundgrid/ground_frame", "base_link", param_ground_frame);
         auto param_eval = rcl_interfaces::msg::ParameterDescriptor{};
         param_eval.description = "Evaluation mode: wait for clouds to be processed";
         eval_ = declare_parameter<bool>("groundgrid/evaluation", false, param_eval);
@@ -248,6 +255,7 @@ class GroundGridNode : public rclcpp::Node {
                     if(n == "groundgrid/min_point_height_thres")            pos(q, cfg.min_point_height_thres, 0.02, 1.0);
                     else if(n == "groundgrid/min_point_height_obstacle_thres") pos(q, cfg.min_point_height_obstacle_thres, 0.02, 1.0);
                     else if(n == "groundgrid/outlier_tolerance")            pos(q, cfg.outlier_tolerance, 0.0, 1.0);
+                    else if(n == "groundgrid/max_ground_descent")           pos(q, cfg.max_ground_descent, 0.0, 1.0);
                     else if(n == "groundgrid/min_ground_patch_detection_point_count_thres") pos(q, cfg.min_ground_patch_detection_point_count_thres, 0.0, 5.0);
                     else if(n == "groundgrid/occupied_cells_point_count_factor") pos(q, cfg.occupied_cells_point_count_factor, 1.0, 200.0);
                     else if(n == "groundgrid/min_outlier_detection_ground_confidence") pos(q, cfg.min_outlier_detection_ground_confidence, 0.0, 10.0);
@@ -448,8 +456,8 @@ class GroundGridNode : public rclcpp::Node {
             return;
 
         try{
-            tf_buffer_.canTransform("base_link", "odom", cloud_msg->header.stamp, rclcpp::Duration(1,std::nano::den/10));
-            mapToBaseTransform = tf_buffer_.lookupTransform("odom", "base_link", cloud_msg->header.stamp);
+            tf_buffer_.canTransform(ground_frame_, "odom", cloud_msg->header.stamp, rclcpp::Duration(1,std::nano::den/10));
+            mapToBaseTransform = tf_buffer_.lookupTransform("odom", ground_frame_, cloud_msg->header.stamp);
             tf_buffer_.canTransform(cloud_msg->header.frame_id, "odom", cloud_msg->header.stamp, rclcpp::Duration(0,std::nano::den/10));
             // Was hardcoded "velodyne" -- a dataset assumption that silently fails on any
             // other robot with "source_frame does not exist". Defaults to velodyne so
@@ -561,6 +569,7 @@ class GroundGridNode : public rclcpp::Node {
     // name of the dataset
     std::string dataset_name;
     std::string sensor_frame_;
+    std::string ground_frame_ = "base_link";
     GroundGrid_Config config_live_;
     rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_cb_;
     // path to the dataset

@@ -443,6 +443,27 @@ template <int S> void GroundSegmentation::detect_ground_patch(grid_map::GridMap&
             // update confidence
             oldConfidence = std::min((pointsblockSum/(config_.occupied_cells_point_count_factor*2.0f) + oldConfidence)/2.0, 1.0);
     }
+    else if(config_.max_ground_descent > 0.0){
+        // Fork: robust, rate-limited descent (see GroundGrid_Config::max_ground_descent).
+        float target = groundlevel;
+        if(config_.ground_descent_target == 1){
+            target = localmin;
+        }
+        else if(config_.ground_descent_target == 2){
+            float mins[S*S]; int n = 0;
+            for(int a=0; a<S; ++a)
+                for(int b=0; b<S; ++b)
+                    if(pointsBlock(a,b) > 0.0f) mins[n++] = minblock(a,b);
+            if(n > 0){
+                std::nth_element(mins, mins + n/2, mins + n);
+                target = mins[n/2];
+            }
+        }
+        if(target < oldGroundheight){
+            oldGroundheight -= std::min(oldGroundheight - target, static_cast<float>(config_.max_ground_descent));
+            oldConfidence = std::min(oldConfidence + 0.1f, 0.5f);
+        }
+    }
     else if(localmin < oldGroundheight){
         // update ground height
         oldGroundheight = localmin;

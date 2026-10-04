@@ -71,6 +71,15 @@ namespace groundgrid {
 
     // Outlier detection tolerance [m]
     double outlier_tolerance = 0.1;
+    // Fork: in high-variance cells, descend toward the robust ground estimate (weighted mean of
+    // per-cell minima) by at most this much per update, instead of jumping to the single lowest
+    // point. 0 keeps upstream's jump-to-minimum, which only ever moves down and, with confidence
+    // frozen inside min_dist, ratchets near cells to the most extreme low outlier on a parked robot.
+    double max_ground_descent = 0.0;
+    // Fork: what a high-variance cell descends toward when max_ground_descent > 0.
+    // 0 = weighted mean of the block's per-cell minima, 1 = the block's lowest cell minimum,
+    // 2 = median of the block's per-cell minima (robust to a few low outliers and to object cells).
+    int ground_descent_target = 2;
 
     // Minimum point count for ground patch detection in percent of expected point count
     double min_ground_patch_detection_point_count_thres = 0.25;
